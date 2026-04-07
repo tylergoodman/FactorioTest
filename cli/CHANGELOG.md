@@ -1,3 +1,14 @@
+## Unreleased
+
+### Bug Fixes
+
+- Fixed WSL2 compatibility: paths passed to the Factorio executable are now converted to Windows format via `wslpath -w`. Factorio is a Windows binary and cannot resolve Linux WSL mount paths (`/mnt/c/...`); this affects `--mod-directory`, `-c` (config path), save/benchmark paths, and `write-data` in `config.ini`.
+- Fixed `write-data` in `config.ini` on WSL2: `\\wsl.localhost\` paths are readable by Windows processes but not writable. `write-data` is now set to the Windows APPDATA Factorio directory so Factorio can always write logs and data.
+- Fixed `mod-settings.dat` initialisation on WSL2: Factorio cannot write during `--create` on a WSL path, so `mod-settings.dat` is now copied from the Windows Factorio installation instead. `fmtk settings set` updates test-specific settings immediately after.
+- Fixed `player-data.json` lookup on WSL2: when the file is not present in the configured data directory, the Windows APPDATA path is now auto-discovered via `cmd.exe /c echo %APPDATA%` and used as a fallback, so fmtk mod portal authentication works without manual configuration.
+- Fixed mod-under-test not loading on WSL2 with `--mod-path`: Factorio (a Windows binary) treats Linux symlinks accessed via `\\wsl.localhost\` as opaque reparse points and silently skips them when scanning for mods. Mod files are now copied into a versioned directory (e.g. `my-mod_1.2.3/`) so Factorio sees a real directory. `ensureModEnabled` explicitly enables the mod in `mod-list.json` since fmtk does not track copied directories the same way as portal-installed zips.
+- Fixed Space Age DLC mods (`quality`, `elevated-rails`, `space-age`) being disabled by `--disableExtra` when testing mods that depend on them: these mods are filtered out of the dependency install path (they ship with Factorio and are never downloaded), so they were never added to the fmtk enable list. They are now included automatically when the mod-under-test declares a dependency on any of them.
+
 ## v3.5.1
 
 ### Changes

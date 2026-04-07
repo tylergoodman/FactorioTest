@@ -15,8 +15,10 @@ import {
 } from "./factorio-process.js"
 import { watchDirectory, watchFile } from "./file-watcher.js"
 import {
+  BUILTIN_MODS,
   configureModToTest,
   ensureConfigIni,
+  ensureModEnabled,
   ensureModSettingsDat,
   installFactorioTest,
   installModDependencies,
@@ -120,9 +122,34 @@ async function setupTestRun(patterns: string[], cliOptions: Record<string, unkno
     await installMods(modsDir, configModRequirements)
   }
 
+  // If the mod-under-test declares a dependency on any DLC mod, include the full DLC
+  // group (quality, elevated-rails, space-age) in the enable list so --disableExtra
+  // does not turn them off. DLC mods are filtered out of modDependencies by
+  // parseModRequirement (they ship with Factorio and are never downloaded), so we must
+  // add them explicitly. We key off declared dependencies rather than always enabling
+  // them, since Space Age is paid DLC and non-DLC users should be unaffected.
+  const dlcMods: string[] = []
+  if (config.modPath) {
+    try {
+      const infoJson = JSON.parse(
+        await fsp.readFile(path.join(path.resolve(config.modPath), "info.json"), "utf8"),
+      ) as { dependencies?: string[] }
+      const declaresDlc = (infoJson.dependencies ?? []).some((dep) => {
+        const name = dep.trim().replace(/^[?!~]\s*|\(\?\)\s*/g, "").split(/\s/)[0]
+        return BUILTIN_MODS.has(name) && name !== "base"
+      })
+      if (declaresDlc) {
+        dlcMods.push(...[...BUILTIN_MODS].filter((m) => m !== "base").map((m) => `${m}=true`))
+      }
+    } catch {
+      // info.json unreadable — skip DLC inference
+    }
+  }
+
   const enableModsOptions = [
     "factorio-test=true",
     `${modToTest}=true`,
+    ...dlcMods,
     ...modDependencies.map((m) => `${m}=true`),
     ...(config.mods?.map((m) => (m.match(/^\S+=(?:true|false)$/) ? m : `${m.split(/\s/)[0]}=true`)) ?? []),
   ]
@@ -172,6 +199,10 @@ async function executeTestRun(ctx: TestRunContext, execOptions?: ExecuteOptions)
       modsDir,
     )
   }
+
+  // fmtk settings commands can regenerate mod-list.json, so ensure the copied
+  // mod-under-test is enabled in mod-list.json as the last step before Factorio runs.
+  if (config.modPath) await ensureModEnabled(modsDir, modToTest)
 
   let result: FactorioTestResult
   try {

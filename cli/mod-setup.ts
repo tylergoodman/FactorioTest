@@ -2,12 +2,15 @@ import * as fsp from "fs/promises"
 import * as fs from "fs"
 import * as path from "path"
 import { runScript, runProcess } from "./process-utils.js"
-import { getFactorioPlayerDataPath } from "./factorio-process.js"
+import { getFactorioPlayerDataPath, getWindowsAppData, toFactorioPath } from "./factorio-process.js"
 import { CliError } from "./cli-error.js"
 
 const MIN_FACTORIO_TEST_VERSION = "3.0.0"
 
-const BUILTIN_MODS = new Set(["base", "quality", "elevated-rails", "space-age"])
+// Mods that ship with the Space Age DLC — present in every Factorio installation
+// that has the DLC, but never downloaded from the mod portal.
+// They form a single cohesive group: enabling one requires enabling all of them.
+export const BUILTIN_MODS = new Set(["base", "quality", "elevated-rails", "space-age"])
 
 type Version = [number, number, number]
 
@@ -31,7 +34,7 @@ export async function configureModToTest(
   verbose?: boolean,
 ): Promise<string> {
   if (modPath) {
-    if (verbose) console.log("Creating mod symlink", modPath)
+    if (verbose) console.log("Copying mod files", modPath)
     return configureModPath(modPath, modsDir)
   } else {
     await configureModName(modsDir, modName!)
@@ -42,9 +45,9 @@ export async function configureModToTest(
 async function configureModPath(modPath: string, modsDir: string): Promise<string> {
   modPath = path.resolve(modPath)
   const infoJsonFile = path.join(modPath, "info.json")
-  let infoJson: { name: unknown }
+  let infoJson: { name: unknown; version?: unknown }
   try {
-    infoJson = JSON.parse(await fsp.readFile(infoJsonFile, "utf8")) as { name: unknown }
+    infoJson = JSON.parse(await fsp.readFile(infoJsonFile, "utf8")) as { name: unknown; version?: unknown }
   } catch (e) {
     throw new CliError(`Could not read info.json file from ${modPath}`, { cause: e })
   }
@@ -52,12 +55,46 @@ async function configureModPath(modPath: string, modsDir: string): Promise<strin
   if (typeof modName !== "string") {
     throw new CliError(`info.json file at ${infoJsonFile} does not contain a string property "name".`)
   }
-  const resultPath = path.join(modsDir, modName)
-  const stat = await fsp.lstat(resultPath).catch(() => undefined)
-  if (stat) await fsp.rm(resultPath, { recursive: true })
+  const modVersion = typeof infoJson.version === "string" ? infoJson.version : undefined
 
-  await fsp.symlink(modPath, resultPath, "junction")
+  // Use a versioned symlink name (e.g. "my-mod_1.2.3") so that fmtk recognises the
+  // entry as a valid installed mod and does not remove it when --disableExtra is used.
+  // Fall back to the bare mod name if the version is missing.
+  const symlinkName = modVersion ? `${modName}_${modVersion}` : modName
+
+  // Remove both the versioned and unversioned entries in case a stale one exists.
+  for (const name of [symlinkName, modName]) {
+    const p = path.join(modsDir, name)
+    const stat = await fsp.lstat(p).catch(() => undefined)
+    if (stat) await fsp.rm(p, { recursive: true })
+  }
+
+  // Copy mod files into a real directory. A Linux symlink via \\wsl.localhost\ appears
+  // as a reparse point to the Windows Factorio executable, which only scans for real
+  // directories and zip files and silently skips reparse points.
+  const resultPath = path.join(modsDir, symlinkName)
+  await copyModFiles(modPath, resultPath)
   return modName
+}
+
+// Directories to skip when copying mod files (not part of the mod, just project noise).
+const COPY_EXCLUDE_DIRS = new Set(["node_modules", ".git", "FactorioTest", "factorio-test-data-dir"])
+// Extensions that Factorio mod files can have.
+const MOD_FILE_EXTS = new Set([".lua", ".json", ".png", ".jpg", ".ogg", ".wav", ".cfg", ".txt"])
+
+async function copyModFiles(srcDir: string, destDir: string): Promise<void> {
+  await fsp.mkdir(destDir, { recursive: true })
+  const entries = await fsp.readdir(srcDir, { withFileTypes: true })
+  for (const entry of entries) {
+    if (entry.name.startsWith(".") || COPY_EXCLUDE_DIRS.has(entry.name)) continue
+    const src = path.join(srcDir, entry.name)
+    const dest = path.join(destDir, entry.name)
+    if (entry.isDirectory()) {
+      await copyModFiles(src, dest)
+    } else if (entry.isFile() && MOD_FILE_EXTS.has(path.extname(entry.name).toLowerCase())) {
+      await fsp.copyFile(src, dest)
+    }
+  }
 }
 
 async function configureModName(modsDir: string, modName: string): Promise<void> {
@@ -125,7 +162,7 @@ async function getInstalledModVersion(modsDir: string, modName: string): Promise
 
 export async function installFactorioTest(modsDir: string): Promise<void> {
   await fsp.mkdir(modsDir, { recursive: true })
-  const playerDataPath = getFactorioPlayerDataPath()
+  const playerDataPath = getFactorioPlayerDataPath(path.dirname(modsDir))
 
   let version = await getInstalledModVersion(modsDir, "factorio-test")
 
@@ -158,6 +195,12 @@ export async function installFactorioTest(modsDir: string): Promise<void> {
 
 export async function ensureConfigIni(dataDir: string): Promise<void> {
   const filePath = path.join(dataDir, "config.ini")
+  // write-data is read by the Factorio executable, so it must be a Windows
+  // path that Factorio can actually write to. On WSL, \\wsl.localhost\ paths
+  // are readable by Windows processes but not writable, so we use the real
+  // Windows APPDATA Factorio directory instead.
+  const appdata = getWindowsAppData()
+  const writeData = appdata ? toFactorioPath(path.join(appdata, "Factorio")) : toFactorioPath(dataDir)
   if (!fs.existsSync(filePath)) {
     console.log("Creating config.ini file")
     await fsp.writeFile(
@@ -166,7 +209,7 @@ export async function ensureConfigIni(dataDir: string): Promise<void> {
 
 [path]
 read-data=__PATH__executable__/../../data
-write-data=${dataDir}
+write-data=${writeData}
 
 [general]
 locale=
@@ -174,7 +217,7 @@ locale=
     )
   } else {
     const content = await fsp.readFile(filePath, "utf8")
-    const newContent = content.replace(/^write-data=.*$/m, `write-data=${dataDir}`)
+    const newContent = content.replace(/^write-data=.*$/m, `write-data=${writeData}`)
     if (content !== newContent) {
       await fsp.writeFile(filePath, newContent)
     }
@@ -195,17 +238,31 @@ export async function ensureModSettingsDat(
   const settingsDat = path.join(modsDir, "mod-settings.dat")
   if (fs.existsSync(settingsDat)) return
 
+  // On WSL, Factorio (a Windows binary) cannot write to \\wsl.localhost\ paths,
+  // so running --create to generate mod-settings.dat fails. Copy it from the
+  // Windows Factorio installation instead — fmtk will update the specific settings
+  // it needs via `fmtk settings set` immediately after this.
+  const appdata = getWindowsAppData()
+  if (appdata) {
+    const windowsSettingsDat = path.join(appdata, "Factorio", "mods", "mod-settings.dat")
+    if (fs.existsSync(windowsSettingsDat)) {
+      if (verbose) console.log("Copying mod-settings.dat from Windows Factorio installation (WSL)")
+      await fsp.copyFile(windowsSettingsDat, settingsDat)
+      return
+    }
+  }
+
   if (verbose) console.log("Creating mod-settings.dat file by running factorio")
   const dummySaveFile = path.join(dataDir, "____dummy_save_file.zip")
   await runProcess(
     false,
     factorioPath,
     "--create",
-    dummySaveFile,
+    toFactorioPath(dummySaveFile),
     "--mod-directory",
-    modsDir,
+    toFactorioPath(modsDir),
     "-c",
-    path.join(dataDir, "config.ini"),
+    toFactorioPath(path.join(dataDir, "config.ini")),
   )
 
   if (fs.existsSync(dummySaveFile)) {
@@ -241,6 +298,28 @@ export async function setSettingsForAutorun(
   await runScript("fmtk", "settings", "unset", "startup", "factorio-test-auto-start", "--modsPath", modsDir)
 }
 
+// fmtk only tracks mods it installed (zip files) and won't add a symlinked directory
+// to mod-list.json. This function ensures the mod is explicitly enabled in mod-list.json
+// regardless of how it was placed in the mods directory.
+export async function ensureModEnabled(modsDir: string, modName: string): Promise<void> {
+  const modListPath = path.join(modsDir, "mod-list.json")
+  let modList: { mods: Array<{ name: string; enabled: boolean }> }
+  try {
+    modList = JSON.parse(await fsp.readFile(modListPath, "utf8"))
+  } catch {
+    modList = { mods: [] }
+  }
+
+  const existing = modList.mods.find((m) => m.name === modName)
+  if (existing) {
+    existing.enabled = true
+  } else {
+    modList.mods.push({ name: modName, enabled: true })
+  }
+
+  await fsp.writeFile(modListPath, JSON.stringify(modList, null, 2))
+}
+
 export async function resetAutorunSettings(modsDir: string, verbose?: boolean): Promise<void> {
   if (verbose) console.log("Disabling auto-start settings")
   await runScript("fmtk", "settings", "set", "startup", "factorio-test-auto-start-config", "{}", "--modsPath", modsDir)
@@ -274,7 +353,7 @@ export function parseRequiredDependencies(dependencies: string[]): ModRequiremen
 }
 
 export async function installMods(modsDir: string, mods: ModRequirement[]): Promise<void> {
-  const playerDataPath = getFactorioPlayerDataPath()
+  const playerDataPath = getFactorioPlayerDataPath(path.dirname(modsDir))
 
   for (const { name, minVersion } of mods) {
     const installedVersion = await getInstalledModVersion(modsDir, name)

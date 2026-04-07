@@ -34,13 +34,63 @@ class BufferLineSplitter extends EventEmitter<{ line: [string] }> {
   }
 }
 
-export function getFactorioPlayerDataPath(): string {
+// WSL runs Node.js as a Linux process but Factorio is a Windows executable.
+// Any path passed as an argument to the Factorio binary must be in Windows
+// format (C:\...) rather than the Linux WSL mount format (/mnt/c/...).
+function isWSL(): boolean {
+  return os.platform() === "linux" && fs.existsSync("/proc/sys/fs/binfmt_misc/WSLInterop")
+}
+
+// Convert a path to the format expected by the Factorio executable.
+// On WSL this calls `wslpath -w` to produce a Windows path; elsewhere it's a no-op.
+export function toFactorioPath(p: string): string {
+  if (!isWSL()) return p
+  const result = spawnSync("wslpath", ["-w", p], { encoding: "utf8" })
+  if (result.status !== 0 || !result.stdout) {
+    throw new CliError(`Failed to convert path to Windows format: ${p}`)
+  }
+  return result.stdout.trim()
+}
+
+// On WSL, resolve the Windows APPDATA directory via cmd.exe and wslpath.
+// Used as a fallback to find player-data.json for mod portal authentication.
+export function getWindowsAppData(): string | undefined {
+  try {
+    const cmdResult = spawnSync("cmd.exe", ["/c", "echo %APPDATA%"], { encoding: "utf8" })
+    if (cmdResult.status !== 0 || !cmdResult.stdout) return undefined
+    const wslResult = spawnSync("wslpath", [cmdResult.stdout.trim()], { encoding: "utf8" })
+    if (wslResult.status !== 0 || !wslResult.stdout) return undefined
+    return wslResult.stdout.trim()
+  } catch {
+    return undefined
+  }
+}
+
+// Returns the path to player-data.json for fmtk mod portal authentication.
+// Resolution order:
+//   1. dataDir/player-data.json, if the file exists there
+//   2. Platform default (win32 / darwin)
+//   3. On WSL: Windows APPDATA/Factorio/player-data.json (auto-discovered via cmd.exe)
+//   4. ~/.factorio/player-data.json
+//
+// Falling back to Windows APPDATA on WSL means a local factorio-test-data-dir
+// works out-of-the-box without requiring a manual copy of player-data.json.
+export function getFactorioPlayerDataPath(dataDir?: string): string {
+  if (dataDir) {
+    const p = path.join(dataDir, "player-data.json")
+    if (fs.existsSync(p)) return p
+    // File not present in dataDir — fall through to platform detection.
+  }
   const platform = os.platform()
   if (platform === "win32") {
     return path.join(process.env.APPDATA!, "Factorio", "player-data.json")
   }
   if (platform === "darwin") {
     return path.join(os.homedir(), "Library", "Application Support", "factorio", "player-data.json")
+  }
+  if (isWSL()) {
+    const appdata = getWindowsAppData()
+    if (appdata) return path.join(appdata, "Factorio", "player-data.json")
   }
   return path.join(os.homedir(), ".factorio", "player-data.json")
 }
@@ -135,6 +185,12 @@ interface OutputComponents {
 }
 
 function factorioLogHint(dataDir: string): string {
+  // On WSL, write-data points to the Windows APPDATA Factorio directory so
+  // that Factorio can actually write there. The log lives there, not in dataDir.
+  if (isWSL()) {
+    const appdata = getWindowsAppData()
+    if (appdata) return `\nCheck Factorio log for details: ${path.join(appdata, "Factorio", "factorio-current.log")}`
+  }
   return `\nCheck Factorio log for details: ${path.join(dataDir, "factorio-current.log")}`
 }
 
@@ -188,13 +244,13 @@ export async function runFactorioTestsHeadless(
 ): Promise<FactorioTestResult> {
   const args = [
     "--benchmark",
-    savePath,
+    toFactorioPath(savePath),
     "--benchmark-ticks",
     "1000000000",
     "--mod-directory",
-    path.join(dataDir, "mods"),
+    toFactorioPath(path.join(dataDir, "mods")),
     "-c",
-    path.join(dataDir, "config.ini"),
+    toFactorioPath(path.join(dataDir, "config.ini")),
     ...additionalArgs,
   ]
 
@@ -306,11 +362,11 @@ export async function runFactorioTestsGraphics(
 ): Promise<FactorioTestResult> {
   const args = [
     "--load-game",
-    savePath,
+    toFactorioPath(savePath),
     "--mod-directory",
-    path.join(dataDir, "mods"),
+    toFactorioPath(path.join(dataDir, "mods")),
     "-c",
-    path.join(dataDir, "config.ini"),
+    toFactorioPath(path.join(dataDir, "config.ini")),
     ...additionalArgs,
   ]
 
